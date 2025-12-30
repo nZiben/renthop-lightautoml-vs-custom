@@ -1,8 +1,3 @@
-# renthop-lightautoml-vs-custom
-**ДОРАБОТКА РЕШЕНИЯ, с учетом замечаний: https://colab.research.google.com/drive/1cCn1300N6bsqcjB6ZAMk9TUt3OQrM3dq?usp=sharing**
-
-
-
 **Kaggle competition:** Two Sigma Connect: Rental Listing Inquiries (RentHop)
 
 This repository contains a mini-research project for the **LightAutoML (LAMA)** course assignment:
