@@ -1,6 +1,6 @@
+# src/models/custom.py
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -15,62 +15,91 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
 from lightgbm import LGBMClassifier
+
 from catboost import CatBoostClassifier
 
 
 # -----------------------------
-# Helpers / small components
+# Helpers
 # -----------------------------
-def _combine_text_cols_factory(text_cols: List[str]):
-    """Create a function for FunctionTransformer to join multiple text cols into one string."""
+def _to_2d_array(X: Any) -> np.ndarray:
+    """Convert input to 2D numpy array (works for DataFrame/Series/ndarray)."""
+    if isinstance(X, pd.DataFrame):
+        arr = X.values
+    elif isinstance(X, pd.Series):
+        arr = X.values.reshape(-1, 1)
+    else:
+        arr = np.asarray(X)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+    return arr
 
-    def _combine_text(X: pd.DataFrame) -> np.ndarray:
-        # X here is a DataFrame slice with columns=text_cols (sklearn passes DataFrame for pandas input)
-        return X[text_cols].fillna("").astype(str).agg(" ".join, axis=1).values
 
-    return _combine_text
+def _combine_text_cols(text_cols: List[str]):
+    """Factory for a FunctionTransformer that concatenates multiple text columns."""
+
+    def _fn(X: Any) -> np.ndarray:
+        # ColumnTransformer may pass either DataFrame slice or ndarray
+        if isinstance(X, pd.DataFrame):
+            df = X
+        else:
+            arr = _to_2d_array(X)
+            df = pd.DataFrame(arr, columns=text_cols[: arr.shape[1]])
+        return df.fillna("").astype(str).agg(" ".join, axis=1).values
+
+    return _fn
 
 
+# -----------------------------
+# Clone-safe Target Encoder
+# -----------------------------
 class MulticlassTargetEncoder(BaseEstimator, TransformerMixin):
-    """Fold-safe multiclass target encoding for categorical columns.
+    """
+    Multiclass target encoding for categorical columns.
 
-    IMPORTANT:
-    - This is a transformer (not a CV loop). It becomes fold-safe automatically when used
-      inside sklearn CV utilities (each fold fits on its train split).
-
-    Output:
-    - For each input categorical column, produces len(labels) numeric columns:
-      P(class=label | category) with smoothing to global prior.
+    IMPORTANT for sklearn clone/cross_validate:
+    - __init__ MUST NOT modify passed parameters.
+      (no list(labels), float(smoothing), etc.)
+    - We only normalize/cast inside fit().
     """
 
-    def __init__(self, labels: Sequence[str], smoothing: float = 20.0, missing_value: str = "UNKNOWN"):
-        self.labels = list(labels)
-        self.smoothing = float(smoothing)
-        self.missing_value = str(missing_value)
+    def __init__(
+        self,
+        labels: Sequence[str],
+        smoothing: float = 20.0,
+        missing_value: str = "UNKNOWN",
+    ):
+        # DO NOT modify these parameters here (clone-safe requirement)
+        self.labels = labels
+        self.smoothing = smoothing
+        self.missing_value = missing_value
 
     def fit(self, X: Any, y: Any):
-        X_arr = self._to_2d_array(X)
+        X_arr = _to_2d_array(X)
         y_ser = pd.Series(y).astype(str)
 
-        self.labels_ = list(self.labels)
+        self.labels_ = list(self.labels)  # OK to convert inside fit
+        smoothing = float(self.smoothing)
+        missing_value = str(self.missing_value)
+
+        # Global prior
         counts = y_ser.value_counts()
         prior = np.array([counts.get(lbl, 0) for lbl in self.labels_], dtype=float)
         prior = prior / max(prior.sum(), 1.0)
         self.prior_ = prior  # shape (K,)
 
-        self.maps_ = []  # list of per-column dict[label -> mapping dict]
+        # For each categorical column: store per-class mapping dict
+        self.maps_ = []
         n_cols = X_arr.shape[1]
 
         for j in range(n_cols):
             col = pd.Series(X_arr[:, j]).astype(str)
-            col = col.replace({"nan": np.nan}).fillna(self.missing_value)
+            col = col.replace({"nan": np.nan}).fillna(missing_value)
 
-            # counts per category per class
             tab = pd.crosstab(col, y_ser).reindex(columns=self.labels_, fill_value=0)
             n = tab.sum(axis=1).values.reshape(-1, 1)  # (C,1)
 
-            # smoothed probs: (tab + s*prior) / (n + s)
-            smoothed = (tab.values + self.smoothing * self.prior_.reshape(1, -1)) / (n + self.smoothing)
+            smoothed = (tab.values + smoothing * self.prior_.reshape(1, -1)) / (n + smoothing)
 
             col_maps = {}
             idx = tab.index.astype(str)
@@ -82,17 +111,19 @@ class MulticlassTargetEncoder(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, X: Any) -> np.ndarray:
-        X_arr = self._to_2d_array(X)
-        if X_arr.shape[1] != getattr(self, "n_in_", X_arr.shape[1]):
+        X_arr = _to_2d_array(X)
+        if hasattr(self, "n_in_") and X_arr.shape[1] != self.n_in_:
             raise ValueError("Unexpected number of categorical columns in transform().")
 
         n_rows = X_arr.shape[0]
         k = len(self.labels_)
         out = np.zeros((n_rows, X_arr.shape[1] * k), dtype=float)
 
+        missing_value = str(self.missing_value)
+
         for j in range(X_arr.shape[1]):
             col = pd.Series(X_arr[:, j]).astype(str)
-            col = col.replace({"nan": np.nan}).fillna(self.missing_value)
+            col = col.replace({"nan": np.nan}).fillna(missing_value)
 
             for t, lbl in enumerate(self.labels_):
                 mapping = self.maps_[j][lbl]
@@ -100,19 +131,9 @@ class MulticlassTargetEncoder(BaseEstimator, TransformerMixin):
 
         return out
 
-    @staticmethod
-    def _to_2d_array(X: Any) -> np.ndarray:
-        if isinstance(X, pd.DataFrame):
-            arr = X.values
-        else:
-            arr = np.asarray(X)
-        if arr.ndim == 1:
-            arr = arr.reshape(-1, 1)
-        return arr
-
 
 # -----------------------------
-# Pipelines / estimators
+# Pipelines / Models
 # -----------------------------
 def make_tfidf_logreg_pipeline(
     numeric_cols: List[str],
@@ -121,9 +142,10 @@ def make_tfidf_logreg_pipeline(
     max_features: int = 60000,
 ) -> Pipeline:
     """TF-IDF(text) + OHE(cats) + numeric -> LogisticRegression multiclass."""
+
     text_pipe = Pipeline(
         steps=[
-            ("combine", FunctionTransformer(_combine_text_cols_factory(text_cols), validate=False)),
+            ("join", FunctionTransformer(_combine_text_cols(text_cols), validate=False)),
             (
                 "tfidf",
                 TfidfVectorizer(
@@ -161,6 +183,7 @@ def make_tfidf_logreg_pipeline(
         sparse_threshold=0.3,
     )
 
+    # IMPORTANT: do NOT pass multi_class (your sklearn raised error before)
     clf = LogisticRegression(
         solver="saga",
         max_iter=500,
@@ -176,12 +199,14 @@ def make_lgbm_ohe_pipeline(
     categorical_cols: List[str],
     params: Optional[Dict[str, Any]] = None,
 ) -> Pipeline:
-    """Tabular baseline: numeric + OHE(cats) -> LightGBM."""
+    """Tabular baseline: numeric + OHE(cats) -> LightGBM multiclass."""
+
     numeric_pipe = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
         ]
     )
+
     cat_pipe = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="most_frequent")),
@@ -223,15 +248,19 @@ def make_lgbm_targetenc_pipeline(
     labels: List[str],
     params: Optional[Dict[str, Any]] = None,
 ) -> Pipeline:
-    """Tabular stronger: numeric + multiclass target encoding(cats) -> LightGBM."""
+    """Tabular stronger: numeric + multiclass target encoding(cats) -> LightGBM.
+
+    This is sklearn-compatible and fold-safe under cross_validate/cross_val_predict:
+    encoder is fit only on the training split of each fold automatically.
+    """
+
     numeric_pipe = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
         ]
     )
 
-    # no SimpleImputer here -> keep values for our transformer
-    cat_te = MulticlassTargetEncoder(labels=labels, smoothing=20.0)
+    cat_te = MulticlassTargetEncoder(labels=labels, smoothing=20.0, missing_value="UNKNOWN")
 
     pre = ColumnTransformer(
         transformers=[
@@ -239,7 +268,7 @@ def make_lgbm_targetenc_pipeline(
             ("cat_te", cat_te, categorical_cols),
         ],
         remainder="drop",
-        sparse_threshold=0.0,  # output will be dense
+        sparse_threshold=0.0,  # dense output
     )
 
     base = dict(
@@ -262,7 +291,7 @@ def make_lgbm_targetenc_pipeline(
 
 
 def make_catboost_model(params: Optional[Dict[str, Any]] = None) -> CatBoostClassifier:
-    """CatBoost sklearn estimator. cat_features must be passed via fit_params in CV."""
+    """CatBoost sklearn estimator. Pass cat_features via fit_params in CV."""
     base = dict(
         loss_function="MultiClass",
         eval_metric="MultiClass",
@@ -280,6 +309,6 @@ def make_catboost_model(params: Optional[Dict[str, Any]] = None) -> CatBoostClas
 
 
 def catboost_fit_params(X: pd.DataFrame, cat_cols: List[str]) -> Dict[str, Any]:
-    """Helper: build fit_params for CatBoost to mark categorical feature indices."""
+    """Build fit_params for CatBoost to mark categorical feature indices."""
     cat_idx = [X.columns.get_loc(c) for c in cat_cols]
     return {"cat_features": cat_idx}
